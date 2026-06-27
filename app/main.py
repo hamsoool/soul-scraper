@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,7 +74,7 @@ app.add_middleware(
 @app.get("/health", tags=["System"])
 async def health_check():
     """Simple API health check endpoint."""
-    return {"status": "ok", "timestamp": func.now()}
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc)}
 
 @app.get("/documents", response_model=List[DocumentListItem], tags=["Documents"])
 async def list_documents(

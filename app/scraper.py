@@ -237,6 +237,257 @@ async def extract_pdf_text(pdf_bytes: bytes) -> str:
     """Wraps the blocking PyMuPDF parser in an async thread pool executor."""
     return await asyncio.to_thread(extract_pdf_text_sync, pdf_bytes)
 
+def parse_price_range(val: str) -> Optional[List[float]]:
+    """
+    Parses a string containing price range (e.g. "53.58 53.58", "71.70  80.60")
+    into a list of floats, or None.
+    """
+    if not val:
+        return None
+    val = val.strip()
+    if val in ("", "-", "0.00", "0.00 - 0.00", "#N/A"):
+        return None
+    parts = [p for p in val.replace("-", " ").split() if p]
+    floats = []
+    for p in parts:
+        try:
+            floats.append(float(p))
+        except ValueError:
+            pass
+    return floats if floats else None
+
+def parse_float(val: str) -> Optional[float]:
+    """Parses a float value from a cell, handling signs and empty/null states."""
+    if not val:
+        return None
+    val = val.strip().replace("\n", " ").replace(" ", "")
+    if val in ("", "-", "0.00", "#N/A"):
+        return None
+    try:
+        if val.startswith("+"):
+            val = val[1:]
+        return float(val)
+    except ValueError:
+        return None
+
+def clean_cell(cell) -> str:
+    if cell is None:
+        return ""
+    return str(cell).strip().replace("\n", " ").replace("  ", " ")
+
+def extract_prices_from_pdf_sync(pdf_bytes: bytes) -> Optional[str]:
+    """
+    Synchronously extracts Zambales (Olongapo City & Subic) gas prices from PDF tables.
+    Returns a JSON string, or None if no Zambales data is found.
+    """
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            results = {}
+            for page in doc:
+                tables = page.find_tables()
+                if not tables or not tables.tables:
+                    continue
+                    
+                for table in tables.tables:
+                    data = table.extract()
+                    if not data or len(data) < 2:
+                        continue
+                        
+                    headers = [clean_cell(h).upper() for h in data[0]]
+                    
+                    province_idx = -1
+                    city_idx = -1
+                    product_idx = -1
+                    range_idx = -1
+                    
+                    for idx, h in enumerate(headers):
+                        if "PROVINCE" in h:
+                            province_idx = idx
+                        elif "CITY" in h or "MUNICIPALITY" in h:
+                            city_idx = idx
+                        elif "PRODUCT" in h:
+                            product_idx = idx
+                        elif "RANGE" in h or "OVERALL" in h:
+                            range_idx = idx
+                    
+                    if province_idx == -1: province_idx = 0
+                    if city_idx == -1: city_idx = 1
+                    if product_idx == -1: product_idx = 2
+                    if range_idx == -1: range_idx = len(headers) - 2
+                    
+                    station_cols = {}
+                    for idx in range(product_idx + 1, range_idx):
+                        h_name = data[0][idx]
+                        if h_name:
+                            station_cols[idx] = clean_cell(h_name)
+                    
+                    current_province = ""
+                    current_city = ""
+                    
+                    for row in data[1:]:
+                        if len(row) <= max(province_idx, city_idx, product_idx, range_idx):
+                            continue
+                            
+                        prov_val = clean_cell(row[province_idx])
+                        if prov_val:
+                            current_province = prov_val
+                        
+                        city_val = clean_cell(row[city_idx])
+                        if city_val:
+                            current_city = city_val
+                        
+                        prod_val = clean_cell(row[product_idx])
+                        if not prod_val:
+                            continue
+                        
+                        if "ZAMBALES" not in current_province.upper():
+                            continue
+                            
+                        city_upper = current_city.upper()
+                        if "OLONGAPO" not in city_upper and "SUBIC" not in city_upper:
+                            continue
+                        
+                        norm_city = "OLONGAPO CITY" if "OLONGAPO" in city_upper else "SUBIC"
+                        
+                        station_prices = {}
+                        for idx, station_name in station_cols.items():
+                            if idx < len(row):
+                                price_val = clean_cell(row[idx])
+                                parsed_price = parse_price_range(price_val)
+                                if parsed_price:
+                                    station_prices[station_name] = parsed_price
+                        
+                        overall_range = clean_cell(row[range_idx])
+                        common_price = clean_cell(row[range_idx + 1]) if range_idx + 1 < len(row) else ""
+                        
+                        if norm_city not in results:
+                            results[norm_city] = {}
+                        
+                        results[norm_city][prod_val] = {
+                            "stations": station_prices,
+                            "overall_range": parse_price_range(overall_range),
+                            "common_price": parse_price_range(common_price)
+                        }
+            
+            if not results:
+                return None
+            return json.dumps(results)
+    except Exception as e:
+        logger.error(f"Error during extract_prices_from_pdf_sync: {e}")
+        return None
+
+def extract_price_adjustments_sync(pdf_bytes: bytes) -> Optional[str]:
+    """
+    Synchronously extracts price adjustments (Gasoline, Diesel, Kerosene) by Oil Company from PDF tables.
+    Returns a JSON string, or None if extraction fails or yields no adjustments.
+    """
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            results = {}
+            for page in doc:
+                tables = page.find_tables()
+                if not tables or not tables.tables:
+                    continue
+                    
+                for table in tables.tables:
+                    data = table.extract()
+                    if not data or len(data) < 3:
+                        continue
+                        
+                    row0_cleaned = [clean_cell(c).upper() for c in data[0]]
+                    has_company = any("COMPANY" in c or "OIL" in c for c in row0_cleaned)
+                    has_effectivity = any("EFFECTIVITY" in c or "EFFECTIVE" in c for c in row0_cleaned)
+                    
+                    if not (has_company and has_effectivity):
+                        continue
+                        
+                    company_idx = -1
+                    received_idx = -1
+                    effective_idx = -1
+                    
+                    for idx, c in enumerate(row0_cleaned):
+                        if "COMPANY" in c or "OIL" in c:
+                            company_idx = idx
+                        elif "RECEIVED" in c or "MESSAGE" in c:
+                            received_idx = idx
+                        elif "EFFECTIVITY" in c or "EFFECTIVE" in c:
+                            effective_idx = idx
+                    
+                    if company_idx == -1: company_idx = 0
+                    if received_idx == -1: received_idx = 1
+                    if effective_idx == -1: effective_idx = 2
+                    
+                    row1_cleaned = [clean_cell(c).upper() for c in data[1]]
+                    
+                    gasoline_idx = -1
+                    diesel_idx = -1
+                    kerosene_idx = -1
+                    
+                    for idx, c in enumerate(row1_cleaned):
+                        if "GASOLINE" in c:
+                            gasoline_idx = idx
+                        elif "DIESEL" in c:
+                            diesel_idx = idx
+                        elif "KEROSENE" in c:
+                            kerosene_idx = idx
+                    
+                    if gasoline_idx == -1: gasoline_idx = 3
+                    if diesel_idx == -1: diesel_idx = 4
+                    if kerosene_idx == -1: kerosene_idx = 5
+                    
+                    for row in data[2:]:
+                        if len(row) <= max(company_idx, received_idx, effective_idx, gasoline_idx, diesel_idx, kerosene_idx):
+                            continue
+                            
+                        company_name = clean_cell(row[company_idx])
+                        if not company_name or "OIL COMPANY" in company_name.upper():
+                            continue
+                            
+                        received_val = clean_cell(row[received_idx])
+                        effective_val = clean_cell(row[effective_idx])
+                        
+                        gasoline_adj = parse_float(row[gasoline_idx])
+                        diesel_adj = parse_float(row[diesel_idx])
+                        kerosene_adj = parse_float(row[kerosene_idx])
+                        
+                        results[company_name] = {
+                            "received": received_val,
+                            "effective": effective_val,
+                            "gasoline": gasoline_adj,
+                            "diesel": diesel_adj,
+                            "kerosene": kerosene_adj
+                        }
+            
+            if not results:
+                return None
+            return json.dumps(results)
+    except Exception as e:
+        logger.error(f"Error during extract_price_adjustments_sync: {e}")
+        return None
+
+async def extract_pdf_content(pdf_bytes: bytes, category: str) -> str:
+    """
+    Extracts text content or parsed JSON tables from PDF bytes depending on category and layout.
+    Wraps blocking extraction functions in thread pool executor.
+    """
+    if category == "North Luzon Pump Prices":
+        try:
+            parsed_json = await asyncio.to_thread(extract_prices_from_pdf_sync, pdf_bytes)
+            if parsed_json:
+                return parsed_json
+        except Exception as e:
+            logger.error(f"Failed to parse North Luzon Pump Prices tables: {e}")
+    elif category == "Price Adjustments":
+        try:
+            parsed_json = await asyncio.to_thread(extract_price_adjustments_sync, pdf_bytes)
+            if parsed_json:
+                return parsed_json
+        except Exception as e:
+            logger.error(f"Failed to parse Price Adjustments tables: {e}")
+            
+    # Default fallback to raw text extraction
+    return await extract_pdf_text(pdf_bytes)
+
 async def download_pdf_stream(client: httpx.AsyncClient, url: str) -> bytes:
     """Streams a PDF file with strict size checks and timeout handling."""
     if not validate_and_resolve_url(url):
@@ -614,7 +865,7 @@ async def sync_doe_data(db_session: AsyncSession) -> dict:
                 pdf_bytes = await download_pdf_stream(client, item["pdf_url"])
                 
                 # Step 5: Extract content
-                text_content = await extract_pdf_text(pdf_bytes)
+                text_content = await extract_pdf_content(pdf_bytes, item["source_category"])
                 
                 # Step 6: Create database record
                 new_doc = Document(
