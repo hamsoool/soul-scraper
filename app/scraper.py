@@ -354,8 +354,7 @@ def extract_prices_from_pdf_sync(pdf_bytes: bytes) -> Optional[str]:
                             if idx < len(row):
                                 price_val = clean_cell(row[idx])
                                 parsed_price = parse_price_range(price_val)
-                                if parsed_price:
-                                    station_prices[station_name] = parsed_price
+                                station_prices[station_name] = parsed_price
                         
                         overall_range = clean_cell(row[range_idx])
                         common_price = clean_cell(row[range_idx + 1]) if range_idx + 1 < len(row) else ""
