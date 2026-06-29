@@ -9,6 +9,40 @@ from rapidocr_onnxruntime import RapidOCR
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Set
 import calendar
+import threading
+import time
+
+class SmoothProgress:
+    def __init__(self, start_percent, end_percent, duration_est=6.0):
+        self.start = start_percent
+        self.end = end_percent
+        self.duration = duration_est
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run)
+        
+    def start_track(self):
+        self.thread.start()
+        
+    def stop_track(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join()
+        
+    def _run(self):
+        steps = 150
+        interval = self.duration / steps
+        for i in range(steps):
+            if self.stop_event.wait(timeout=interval):
+                break
+            t = (i + 1) / steps
+            current_val = self.start + (self.end - self.start) * t * 0.95
+            
+            bar_length = 20
+            filled_length = int(round(bar_length * current_val / 100))
+            bar = '#' * filled_length + '-' * (bar_length - filled_length)
+            
+            print(f"\rOCR Progress: [{bar}] {current_val:.1f}%", end="", flush=True)
+
 
 import httpx
 from bs4 import BeautifulSoup
@@ -392,16 +426,30 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
         results = {}
         
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            total_pages = len(doc)
             for page_idx, page in enumerate(doc):
-                pix = page.get_pixmap(dpi=150)
-                img_data = pix.tobytes("png")
+                base_percent = int(page_idx / total_pages * 100)
+                next_percent = int((page_idx + 1) / total_pages * 100)
+                tracker = SmoothProgress(base_percent, next_percent, duration_est=6.0)
+                tracker.start_track()
                 
-                img = Image.open(io.BytesIO(img_data))
-                if img.mode == 'RGBA':
-                    img = img.convert('RGB')
-                img_np = np.array(img)
-                
-                result, _ = engine(img_np)
+                try:
+                    pix = page.get_pixmap(dpi=150)
+                    img_data = pix.tobytes("png")
+                    
+                    img = Image.open(io.BytesIO(img_data))
+                    if img.mode == 'RGBA':
+                        img = img.convert('RGB')
+                    img_np = np.array(img)
+                    
+                    result, _ = engine(img_np)
+                finally:
+                    tracker.stop_track()
+                    bar_length = 20
+                    filled_length = int(round(bar_length * next_percent / 100))
+                    bar = '#' * filled_length + '-' * (bar_length - filled_length)
+                    print(f"\rOCR Progress: [{bar}] {next_percent:.1f}%", end="", flush=True)
+                    
                 if not result:
                     continue
                 
@@ -588,7 +636,8 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                         "overall_range": overall_range,
                         "common_price": common_price
                     }
-                    
+        print()
+        
         if results:
             logger.info("Successfully extracted Zambales data using OCR!")
             return json.dumps(results)
@@ -722,10 +771,12 @@ async def download_pdf_stream(client: httpx.AsyncClient, url: str) -> bytes:
             
             # Check Content-Length header if available
             content_length = response.headers.get("Content-Length")
+            total_size = None
             if content_length:
                 try:
-                    if int(content_length) > settings.MAX_PDF_SIZE_BYTES:
-                        raise ValueError(f"PDF exceeds size limit: {content_length} bytes (limit is {settings.MAX_PDF_SIZE_BYTES})")
+                    total_size = int(content_length)
+                    if total_size > settings.MAX_PDF_SIZE_BYTES:
+                        raise ValueError(f"PDF exceeds size limit: {total_size} bytes (limit is {settings.MAX_PDF_SIZE_BYTES})")
                 except ValueError as e:
                     if "exceeds size limit" in str(e):
                         raise e
@@ -736,6 +787,17 @@ async def download_pdf_stream(client: httpx.AsyncClient, url: str) -> bytes:
                 pdf_bytes.extend(chunk)
                 if len(pdf_bytes) > settings.MAX_PDF_SIZE_BYTES:
                     raise ValueError(f"PDF exceeded size limit during download: {len(pdf_bytes)} bytes")
+                
+                # Show dynamic download progress percentage
+                if total_size:
+                    percent = len(pdf_bytes) / total_size * 100
+                    bar_length = 20
+                    filled_length = int(round(bar_length * percent / 100))
+                    bar = '#' * filled_length + '-' * (bar_length - filled_length)
+                    print(f"\rDownloading PDF: [{bar}] {percent:.1f}% ({len(pdf_bytes)}/{total_size} bytes)", end="", flush=True)
+                else:
+                    print(f"\rDownloading PDF: {len(pdf_bytes)} bytes", end="", flush=True)
+            print() # Print newline once download finishes
                     
             return bytes(pdf_bytes)
     except Exception as e:
@@ -921,10 +983,10 @@ async def scrape_source_page(client: httpx.AsyncClient, source_url: str, categor
                 #    which causes fallback to article publish date and lets all 100+
                 #    historical PDFs through. URL filenames encode the actual date.)
                 now = datetime.now(timezone.utc)
+                two_months_ago = now - timedelta(days=60)
                 if category == "Price Adjustments":
-                    two_weeks_ago = now - timedelta(days=14)
-                    if published_dt < two_weeks_ago:
-                        logger.info(f"Filtering out '{doc_title}' published at {published_dt} (older than 2 weeks)")
+                    if published_dt < two_months_ago:
+                        logger.info(f"Filtering out '{doc_title}' published at {published_dt} (older than 2 months)")
                         continue
                 elif category == "North Luzon Pump Prices":
                     # Always use the URL-extracted date — it's the most reliable signal.
@@ -937,10 +999,10 @@ async def scrape_source_page(client: httpx.AsyncClient, source_url: str, categor
                             f"Skipping '{doc_title}': cannot parse date from URL '{pdf_url}'"
                         )
                         continue
-                    if url_date.year != now.year or url_date.month != now.month:
+                    if url_date < two_months_ago:
                         logger.info(
                             f"Filtering out '{doc_title}' — PDF date {url_date.date()} "
-                            f"is not in {now.year}-{now.month:02d}"
+                            f"is older than 2 months"
                         )
                         continue
                     # Use the URL-extracted date as the canonical published date
