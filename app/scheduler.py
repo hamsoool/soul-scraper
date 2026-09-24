@@ -19,23 +19,24 @@ sync_state: Dict[str, Any] = {
 
 scheduler = AsyncIOScheduler()
 
-async def execute_sync_job() -> None:
-    """Scheduled task wrapper that creates a DB session and runs the sync."""
+async def run_sync(source: str) -> None:
+    """Runs the DOE sync once: guarded against re-entry, creates a session, updates sync_state.
+    Shared by the scheduled job and the manual /sync endpoint."""
     if sync_state["is_syncing"]:
-        logger.warning("Sync is already running. Skipping scheduled execution.")
+        logger.warning(f"{source}: sync is already running. Skipping.")
         return
-        
+
     sync_state["is_syncing"] = True
-    logger.info("Background scheduled sync job started.")
-    
+    logger.info(f"{source} sync started.")
+
     async with async_session() as session:
         try:
             result = await sync_doe_data(session)
             sync_state["last_sync_time"] = datetime.now(timezone.utc)
             sync_state["last_sync_result"] = result
-            logger.info(f"Background scheduled sync job finished. Result: {result}")
+            logger.info(f"{source} sync finished. Result: {result}")
         except Exception as e:
-            logger.error(f"Error in background scheduled sync job: {e}")
+            logger.error(f"Error in {source} sync: {e}")
             sync_state["last_sync_result"] = {"status": "error", "message": str(e)}
         finally:
             sync_state["is_syncing"] = False
@@ -44,7 +45,8 @@ def start_scheduler() -> None:
     """Starts the background scheduler and registers the sync job."""
     if not scheduler.running:
         scheduler.add_job(
-            execute_sync_job,
+            run_sync,
+            args=["scheduled"],
             trigger=IntervalTrigger(hours=settings.SYNC_INTERVAL_HOURS),
             id="doe_sync_job",
             name="DOE PDF scraper synchronization",

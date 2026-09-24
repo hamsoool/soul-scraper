@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -13,8 +14,7 @@ from app.config import settings
 from app.database import engine, Base, get_db, async_session
 from app.models import Document
 from app.schemas import DocumentListItem, DocumentRead, StatsResponse, SyncResponse
-from app.scheduler import start_scheduler, stop_scheduler, sync_state, execute_sync_job
-from app.scraper import sync_doe_data
+from app.scheduler import start_scheduler, stop_scheduler, sync_state, run_sync
 from app.security import verify_api_key
 
 # Configure logging format and levels
@@ -42,18 +42,15 @@ async def lifespan(app: FastAPI):
             count = result.scalar()
             if count == 0:
                 logger.info("Database is empty. Queueing first sync job...")
-                asyncio_loop = asyncio.get_event_loop()
-                asyncio_loop.create_task(execute_sync_job())
-            
+                asyncio.create_task(run_sync("startup"))
+
     yield
-    
+
     # Shutdown actions
     logger.info("Shutting down services...")
     if settings.ENABLE_SCRAPER_SCHEDULER:
         stop_scheduler()
     await engine.dispose()
-
-import asyncio
 
 app = FastAPI(
     title="Department of Energy Philippines PDF Aggregator API",
@@ -127,25 +124,6 @@ async def get_latest_documents(db: AsyncSession = Depends(get_db), _key: str = D
             
     return latest_docs
 
-async def run_manual_sync():
-    """Wrapper task for manual background sync."""
-    if sync_state["is_syncing"]:
-        logger.warning("Manual sync requested but a sync session is already in progress.")
-        return
-        
-    sync_state["is_syncing"] = True
-    async with async_session() as session:
-        try:
-            result = await sync_doe_data(session)
-            sync_state["last_sync_time"] = datetime.now(timezone.utc)
-            sync_state["last_sync_result"] = result
-            logger.info(f"Manual sync completed. Result: {result}")
-        except Exception as e:
-            logger.error(f"Error during manual sync: {e}")
-            sync_state["last_sync_result"] = {"status": "error", "message": str(e)}
-        finally:
-            sync_state["is_syncing"] = False
-
 @app.post("/sync", response_model=SyncResponse, status_code=status.HTTP_202_ACCEPTED, tags=["System"])
 async def trigger_sync(background_tasks: BackgroundTasks, _key: str = Depends(verify_api_key)):
     """Triggers the DOE website scraper manually in the background without blocking the API."""
@@ -157,8 +135,8 @@ async def trigger_sync(background_tasks: BackgroundTasks, _key: str = Depends(ve
             errors=[]
         )
         
-    # Queue the sync execution to run in FastAPI's background thread/task pool
-    background_tasks.add_task(run_manual_sync)
+    # Queue the sync execution to run in FastAPI's background task pool
+    background_tasks.add_task(run_sync, "manual")
     
     return SyncResponse(
         status="accepted",

@@ -44,7 +44,7 @@ async def verify_api_key(
 # ---------------------------------------------------------------------------
 
 ALLOWED_SCHEME = "https"
-ALLOWED_DOMAINS = {"doe.gov.ph", "www.doe.gov.ph", "prod-cms.doe.gov.ph"}
+ALLOWED_DOMAINS = {"doe.gov.ph", "www.doe.gov.ph", "prod-cms.doe.gov.ph", "d24qbtp4vooyzi.cloudfront.net"}
 
 def is_internal_ip(ip_str: str) -> bool:
     """Check if an IP address belongs to loopback, private or local ranges."""

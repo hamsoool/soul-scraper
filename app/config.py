@@ -21,9 +21,6 @@ class Settings(BaseSettings):
     # Server Settings
     HOST: str = Field(default="0.0.0.0")
     PORT: int = Field(default=8000)
-    
-    # Render Cron specific flag (if running as a pure CLI command in render cron)
-    RUN_ONCE_AND_EXIT: bool = Field(default=False)
 
     model_config = SettingsConfigDict(
         env_file=".env",

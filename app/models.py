@@ -14,9 +14,8 @@ class Document(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    # Explicit indexes requested by requirements
+    # Explicit indexes for query paths used by the API
     __table_args__ = (
-        Index("idx_documents_pdf_url", "pdf_url"),
         Index("idx_documents_published_date", "published_date"),
         Index("idx_documents_created_at", "created_at"),
     )

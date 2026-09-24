@@ -7,42 +7,8 @@ import numpy as np
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple, Optional, Set
+from typing import List, Optional, Set
 import calendar
-import threading
-import time
-
-class SmoothProgress:
-    def __init__(self, start_percent, end_percent, duration_est=6.0):
-        self.start = start_percent
-        self.end = end_percent
-        self.duration = duration_est
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run)
-        
-    def start_track(self):
-        self.thread.start()
-        
-    def stop_track(self):
-        self.stop_event.set()
-        if self.thread.is_alive():
-            self.thread.join()
-        
-    def _run(self):
-        steps = 150
-        interval = self.duration / steps
-        for i in range(steps):
-            if self.stop_event.wait(timeout=interval):
-                break
-            t = (i + 1) / steps
-            current_val = self.start + (self.end - self.start) * t * 0.95
-            
-            bar_length = 20
-            filled_length = int(round(bar_length * current_val / 100))
-            bar = '#' * filled_length + '-' * (bar_length - filled_length)
-            
-            print(f"\rOCR Progress: [{bar}] {current_val:.1f}%", end="", flush=True)
-
 
 import httpx
 from bs4 import BeautifulSoup
@@ -50,7 +16,6 @@ import fitz  # PyMuPDF
 from sqlalchemy.future import select
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from urllib.parse import urljoin, urlparse
 
 from app.config import settings
 from app.models import Document
@@ -61,182 +26,48 @@ logger = logging.getLogger(__name__)
 # Target Sources
 SOURCES = [
     {
-        "url": "https://doe.gov.ph/articles/group/liquid-fuels?maincat=Retail%20Pump%20Prices&subcategory=Price%20Adjustments&display_type=Card",
+        "url": "https://doe.gov.ph/data-and-prices/liquid-fuels/retail-pump-prices/price-adjustments",
         "category": "Price Adjustments"
     },
     {
-        "url": "https://doe.gov.ph/articles/group/liquid-fuels?maincat=Retail%20Pump%20Prices&subcategory=North%20Luzon%20Pump%20Prices&display_type=Card",
+        "url": "https://doe.gov.ph/data-and-prices/liquid-fuels/retail-pump-prices/north-luzon-pump-prices",
         "category": "North Luzon Pump Prices"
     }
 ]
 
-MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+# Month abbreviation lookup for attachment title date parsing
+MONTH_ABBREVS: dict[str, int] = {m[:3].lower(): i for i, m in enumerate(calendar.month_abbr) if m}
 
-# Month abbreviation lookup for PDF URL date parsing
-MONTH_ABBREVS: dict[str, int] = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-
-def parse_date_from_text(text: str, fallback_date: datetime = None) -> datetime:
-    """Extracts a datetime object from a text snippet, resolving patterns like 'June 2 to 8, 2026' or MMDDYYYY."""
-    if not text:
-        return fallback_date or datetime.now(timezone.utc)
-        
-    text_lower = text.lower()
-    
-    # 1. Search for MMDDYYYY in string, e.g. 05262026
-    match_digits = re.search(r'\b(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(20\d{2})\b', text)
-    if match_digits:
-        m, d, y = map(int, match_digits.groups())
-        try:
-            return datetime(y, m, d, tzinfo=timezone.utc)
-        except ValueError:
-            pass
-            
-    # 2. Search for named month patterns like "June 2 to 8, 2026" or "May 26-June 1, 2026"
-    month_name = None
-    month_val = 1
-    for m, val in MONTHS.items():
-        if m in text_lower:
-            month_name = m
-            month_val = val
-            break
-            
-    if not month_name:
-        return fallback_date or datetime.now(timezone.utc)
-        
-    # Search for a 4-digit year starting with 20
-    year_match = re.search(r'\b(20\d{2})\b', text)
-    year = int(year_match.group(1)) if year_match else (fallback_date.year if fallback_date else datetime.now().year)
-    
-    # Search for day numbers (1 to 31)
-    numbers = [int(n) for n in re.findall(r'\b(\d{1,2})\b', text) if 1 <= int(n) <= 31]
-    
-    day = 1
-    if numbers:
-        # Use the first number representing start of date range
-        day = numbers[0]
-        
+def parse_attachment_date(title: str) -> Optional[datetime]:
+    """Extracts the start date of a DOE price-notice date range from an attachment
+    title or link text. Handles '15-21 Sep 2026', 'Sep 1-7', '01-07 September 2026',
+    'September 15-21' and 'DATED SEPTEMBER 17 2026' — anchored on the month token, so a
+    day-range before the month wins ('15-21 Sep' → 15, not 21). Returns the range's
+    start day, or None if no month appears in the text."""
+    t = title.replace("%20", " ").lower().replace("/", " ")
+    pos, month = None, None
+    for abbr, val in MONTH_ABBREVS.items():
+        found = t.find(abbr)
+        if found != -1 and (pos is None or found < pos):
+            pos, month = found, val
+    if not month:
+        return None
+    token = t[pos:pos + 3]
+    # Day after the month, e.g. 'Sep 8-14', 'September 17 2026'
+    after = re.search(rf"{re.escape(token)}\w*\s*(\d{{1,2}})(?!\d)", t)
+    # Day range before the month, e.g. '15-21 Sep 2026', '01-07 September 2026'
+    before = re.search(rf"(\d{{1,2}})(?:-\d{{1,2}})?\s+{re.escape(token)}\w*", t)
+    day_match = after or before
+    day = int(day_match.group(1)) if day_match else 1
+    window = t[max(0, pos - 30):pos + 30]
+    year_match = re.search(r"(?<!\d)(20\d{2})(?!\d)", window)
+    # ponytail: year-less titles ('Sep 1-7') assume the current year; a stale year-less
+    # file revisiting an old week in a future September would slip past the 2-month filter.
+    # Upgrade: pass the page's own anchor year, or cross-check the PDF filename.
+    year = int(year_match.group(1)) if year_match else datetime.now(timezone.utc).year
     try:
-        return datetime(year, month_val, day, tzinfo=timezone.utc)
-    except Exception:
-        return fallback_date or datetime.now(timezone.utc)
-
-def parse_date_from_pdf_url(url: str) -> Optional[datetime]:
-    """
-    Extracts the start date from a DOE pump price PDF URL filename.
-
-    Strategy: anchor on the 4-digit year (most reliable), then find the month
-    abbreviation appearing before it, then extract the first day number.
-    This handles all known DOE naming patterns including cross-month ranges:
-
-      lf-price-monitoring-for-june-16-22-2026-pdf  → June 16, 2026
-      lf-price-monitoring-for-may-26-june-1-2026-pdf → May 26, 2026  (cross-month: use first month)
-      lf-price-monitoring-for-dec-10-16-2024-pdf   → December 10, 2024
-      nluz_regiii_dec-10-16_2024-pdf               → December 10, 2024
-
-    Returns None if year or month cannot be found — caller should REJECT the doc.
-    """
-    try:
-        # Isolate filename and normalise
-        filename = url.rstrip("/").split("/")[-1].lower()
-        # Strip trailing -pdf, -pdf1, -pdf2 … suffixes
-        filename = re.sub(r"-pdf\d*$", "", filename)
-
-        # Step 1: find the 4-digit year (always appears near the end)
-        year_m = re.search(r'(?<!\d)(20\d{2})(?!\d)', filename)
-        if not year_m:
-            return None
-        year = int(year_m.group(1))
-
-        # Step 2: find ALL month abbreviations that appear BEFORE the year
-        before_year = filename[:year_m.start()]
-        month_hits = list(re.finditer(
-            r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*',
-            before_year
-        ))
-        if not month_hits:
-            return None
-
-        # Use the FIRST month (start of the date range)
-        first_hit = month_hits[0]
-        month = MONTH_ABBREVS.get(first_hit.group(1)[:3], 0)
-        if not month:
-            return None
-
-        # Step 3: find the first day number that appears after the month
-        after_first_month = before_year[first_hit.end():]
-        day_m = re.search(r'[-_](\d{1,2})(?=[-_]|$)', after_first_month)
-        day = int(day_m.group(1)) if day_m else 1
-
         return datetime(year, month, day, tzinfo=timezone.utc)
-
-    except Exception:
-        pass
-    return None
-
-def parse_nuxt_state(js_content: str) -> Optional[Tuple[List[str], str, List]]:
-    """Parses a Nuxt state block and extracts (parameters, body_str, arguments_list)."""
-    func_start = js_content.find('(function(')
-    if func_start == -1:
-        return None
-        
-    param_start = func_start + len('(function(')
-    param_end = js_content.find(')', param_start)
-    params_str = js_content[param_start:param_end]
-    params = [p.strip() for p in params_str.split(',')]
-    
-    return_str = '{return '
-    return_idx = js_content.find(return_str, param_end)
-    if return_idx == -1:
-        return None
-    body_start = return_idx + len(return_str)
-    
-    # Look for the boundary matching } ( ... ) at the end
-    matches = list(re.finditer(r'\}\s*\(', js_content))
-    if not matches:
-        return None
-    boundary_match = matches[-1]
-    body_end = boundary_match.start()
-    arg_start = boundary_match.end() - 1
-    
-    body_str = js_content[body_start:body_end]
-    
-    # Track parentheses to extract arguments list
-    balance = 0
-    arg_end = -1
-    for idx in range(arg_start, len(js_content)):
-        char = js_content[idx]
-        if char == '(':
-            balance += 1
-        elif char == ')':
-            balance -= 1
-            if balance == 0:
-                arg_end = idx
-                break
-                
-    if arg_end == -1:
-        return None
-        
-    args_str = js_content[arg_start+1:arg_end]
-    
-    # Decode string escape patterns for arguments
-    try:
-        args_decoded = args_str.encode('utf-8').decode('unicode-escape')
-    except Exception as e:
-        logger.error(f"Unicode decode error on Nuxt JS arguments: {e}")
-        args_decoded = args_str
-        
-    args_json = args_decoded
-    args_json = re.sub(r'void 0', 'null', args_json)
-    args_json = re.sub(r'new Date\(\d+\)', 'null', args_json)
-    
-    try:
-        args_list = json.loads(f"[{args_json}]")
-        return params, body_str, args_list
-    except Exception as e:
-        logger.error(f"Failed to load Nuxt arguments list as JSON: {e}")
+    except ValueError:
         return None
 
 async def fetch_with_backoff(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
@@ -426,30 +257,17 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
         results = {}
         
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            total_pages = len(doc)
-            for page_idx, page in enumerate(doc):
-                base_percent = int(page_idx / total_pages * 100)
-                next_percent = int((page_idx + 1) / total_pages * 100)
-                tracker = SmoothProgress(base_percent, next_percent, duration_est=6.0)
-                tracker.start_track()
+            for page in doc:
+                pix = page.get_pixmap(dpi=150)
+                img_data = pix.tobytes("png")
                 
-                try:
-                    pix = page.get_pixmap(dpi=150)
-                    img_data = pix.tobytes("png")
-                    
-                    img = Image.open(io.BytesIO(img_data))
-                    if img.mode == 'RGBA':
-                        img = img.convert('RGB')
-                    img_np = np.array(img)
-                    
-                    result, _ = engine(img_np)
-                finally:
-                    tracker.stop_track()
-                    bar_length = 20
-                    filled_length = int(round(bar_length * next_percent / 100))
-                    bar = '#' * filled_length + '-' * (bar_length - filled_length)
-                    print(f"\rOCR Progress: [{bar}] {next_percent:.1f}%", end="", flush=True)
-                    
+                img = Image.open(io.BytesIO(img_data))
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                img_np = np.array(img)
+                
+                result, _ = engine(img_np)
+                
                 if not result:
                     continue
                 
@@ -636,7 +454,6 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                         "overall_range": overall_range,
                         "common_price": common_price
                     }
-        print()
         
         if results:
             logger.info("Successfully extracted Zambales data using OCR!")
@@ -787,235 +604,68 @@ async def download_pdf_stream(client: httpx.AsyncClient, url: str) -> bytes:
                 pdf_bytes.extend(chunk)
                 if len(pdf_bytes) > settings.MAX_PDF_SIZE_BYTES:
                     raise ValueError(f"PDF exceeded size limit during download: {len(pdf_bytes)} bytes")
-                
-                # Show dynamic download progress percentage
-                if total_size:
-                    percent = len(pdf_bytes) / total_size * 100
-                    bar_length = 20
-                    filled_length = int(round(bar_length * percent / 100))
-                    bar = '#' * filled_length + '-' * (bar_length - filled_length)
-                    print(f"\rDownloading PDF: [{bar}] {percent:.1f}% ({len(pdf_bytes)}/{total_size} bytes)", end="", flush=True)
-                else:
-                    print(f"\rDownloading PDF: {len(pdf_bytes)} bytes", end="", flush=True)
-            print() # Print newline once download finishes
                     
             return bytes(pdf_bytes)
     except Exception as e:
         logger.error(f"Error during PDF download stream from {url}: {e}")
         raise e
 
+PDF_FILE_URL_RE = re.compile(r"cloudfront\.net/api/media/file/.+\.pdf", re.IGNORECASE)
+
 async def scrape_source_page(client: httpx.AsyncClient, source_url: str, category: str) -> List[dict]:
-    """Scrapes a target DOE page and returns extracted document metadata records."""
+    """Scrapes a DOE category page and returns the price-notice PDF records.
+
+    DOE reworked its site (Sept 2026): each Retail Pump Prices category page now lists
+    its PDFs as plain <a href="https://d24qbtp4vooyzi.cloudfront.net/api/media/file/*.pdf">
+    links inside the CMS content — no article list to unwrap. The anchor text is the
+    notice title (Price Adjustments) or the price-week date range (North Luzon), from
+    which the published date is parsed."""
     if not validate_and_resolve_url(source_url):
         logger.error(f"Security Policy Blocked: Source URL {source_url} is invalid or unsafe")
         return []
-        
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    
+
     try:
         logger.info(f"Fetching source list page: {source_url}")
         response = await fetch_with_backoff(client, source_url, headers=headers, timeout=settings.HTTP_TIMEOUT_SECONDS)
-        html = response.text
     except Exception as e:
         logger.error(f"Failed to fetch list page {source_url}: {e}")
         return []
-        
-    # Extract Nuxt state script
-    soup = BeautifulSoup(html, "html.parser")
-    script_tags = soup.find_all("script")
-    nuxt_script = None
-    for script in script_tags:
-        if script.string and "__NUXT__" in script.string:
-            nuxt_script = script.string
-            break
-            
-    if not nuxt_script:
-        logger.error(f"Nuxt script tag not found on page {source_url}")
-        return []
-        
-    parsed = parse_nuxt_state(nuxt_script)
-    if not parsed:
-        logger.error(f"Failed to parse Nuxt state for {source_url}")
-        return []
-        
-    params, body_str, args_list = parsed
-    mapping = dict(zip(params, args_list))
-    
-    # Extract individual articles from raw body string
-    articles_start = body_str.find("articles:[")
-    if articles_start == -1:
-        logger.warning(f"No articles list found in Nuxt state for {source_url}")
-        return []
-        
-    # Find matching closing bracket for the articles array
-    balance = 0
-    articles_end = -1
-    for idx in range(articles_start + len("articles:[") - 1, len(body_str)):
-        char = body_str[idx]
-        if char == '[':
-            balance += 1
-        elif char == ']':
-            balance -= 1
-            if balance == 0:
-                articles_end = idx
-                break
-                
-    if articles_end == -1:
-        logger.warning("Unbalanced articles list brackets in Nuxt state")
-        return []
-        
-    articles_str = body_str[articles_start:articles_end+1]
-    article_indices = [m.start() for m in re.finditer(r'\{id:', articles_str)]
-    
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    two_months_ago = datetime.now(timezone.utc) - timedelta(days=60)
     records = []
-    
-    for i, start_idx in enumerate(article_indices):
-        end_idx = article_indices[i+1] if i+1 < len(article_indices) else len(articles_str) - 1
-        art_segment = articles_str[start_idx:end_idx]
-        
-        # Extract article fields
-        id_match = re.search(r'id:(\d+)', art_segment)
-        art_id = id_match.group(1) if id_match else None
-        if not art_id:
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not PDF_FILE_URL_RE.search(href):
             continue
-            
-        title_match = re.search(r'title:([^,]+)', art_segment)
-        title_var = title_match.group(1).strip() if title_match else ""
-        title = mapping.get(title_var, title_var) if title_var in mapping else title_var
-        if isinstance(title, str):
-            if (title.startswith('"') and title.endswith('"')) or (title.startswith("'") and title.endswith("'")):
-                try:
-                    title = title[1:-1].encode('utf-8').decode('unicode-escape')
-                except Exception:
-                    title = title[1:-1]
-            else:
-                try:
-                    title = title.encode('utf-8').decode('unicode-escape')
-                except Exception:
-                    pass
-            
-        date_match = re.search(r'datePublished:([^,|}]+)', art_segment)
-        date_var = date_match.group(1).strip() if date_match else ""
-        date_val = mapping.get(date_var, date_var) if date_var in mapping else date_var
-        if isinstance(date_val, str):
-            try:
-                date_val = date_val.encode('utf-8').decode('unicode-escape')
-            except Exception:
-                pass
-        
-        # Convert publish date to datetime
-        fallback_dt = None
-        if date_val:
-            try:
-                # ISO date string handling
-                fallback_dt = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
-            except Exception:
-                pass
-        if not fallback_dt:
-            fallback_dt = datetime.now(timezone.utc)
-            
-        # Parse content field (extract raw JSON string first)
-        content_match = re.search(r'content:("(?:[^"\\]|\\.)*")', art_segment)
-        content_html = ""
-        if content_match:
-            try:
-                content_html_raw = json.loads(content_match.group(1))
-                content_html = content_html_raw.encode('utf-8').decode('unicode-escape')
-            except Exception as e:
-                logger.error(f"Error decoding content HTML of article {art_id}: {e}")
-                content_html = content_match.group(1)
-                
-        if not content_html:
+        # The CDN serves the same file under dev/media vs dev/media-0 query prefixes — treat as one.
+        # (split('?') keeps them distinct from filenames sharing a real URL-escaped suffix)
+        key = href.split("?")[0]
+        if key in seen:
             continue
-            
-        # Parse links using BeautifulSoup inside the article content
-        art_soup = BeautifulSoup(content_html, "html.parser")
-        links = art_soup.find_all("a")
-        
-        for a in links:
-            href = a.get("href")
-            if not href:
-                continue
-                
-            # We are interested in Liferay guest document links (/documents/d/guest/...)
-            if "/documents/" in href and "guest" in href:
-                # Resolve it to absolute URL on the prod-cms host
-                cms_base = "https://prod-cms.doe.gov.ph"
-                pdf_url = urljoin(cms_base, href)
-                
-                link_text = a.get_text(strip=True)
-                
-                # Determine title
-                if category == "Price Adjustments":
-                    # For price adjustments, the link text is often the article title or adjustment name
-                    doc_title = link_text if len(link_text) > 10 else title
-                else:
-                    # For North Luzon pump prices, the link text is the date range (e.g. June 2 to 8, 2026)
-                    # We combine it with the main article title for a better record description
-                    doc_title = f"{title} - {link_text}"
-                    
-                # Determine published date from link text, fallback to article date
-                published_dt = parse_date_from_text(link_text, fallback_dt)
-                
-                # Source page URL for reference
-                # If we have article slug, we can construct the direct article URL
-                slug_match = re.search(r'friendlyUrlPath:([^,]+)', art_segment)
-                slug_var = slug_match.group(1).strip() if slug_match else ""
-                slug = mapping.get(slug_var, slug_var) if slug_var in mapping else slug_var
-                if isinstance(slug, str):
-                    if (slug.startswith('"') and slug.endswith('"')) or (slug.startswith("'") and slug.endswith("'")):
-                        try:
-                            slug = slug[1:-1].encode('utf-8').decode('unicode-escape')
-                        except Exception:
-                            slug = slug[1:-1]
-                    else:
-                        try:
-                            slug = slug.encode('utf-8').decode('unicode-escape')
-                        except Exception:
-                            pass
-                    
-                source_article_url = urljoin("https://doe.gov.ph", f"/articles/{slug}") if slug else source_url
-                
-                # Apply Date Filters:
-                # 1. Price Adjustments: only the past 2 weeks (14 days)
-                # 2. North Luzon Pump Prices: use PDF URL date (most reliable — link text
-                #    is often just a region label like "Region III" with no date info,
-                #    which causes fallback to article publish date and lets all 100+
-                #    historical PDFs through. URL filenames encode the actual date.)
-                now = datetime.now(timezone.utc)
-                two_months_ago = now - timedelta(days=60)
-                if category == "Price Adjustments":
-                    if published_dt < two_months_ago:
-                        logger.info(f"Filtering out '{doc_title}' published at {published_dt} (older than 2 months)")
-                        continue
-                elif category == "North Luzon Pump Prices":
-                    # Always use the URL-extracted date — it's the most reliable signal.
-                    # Do NOT fall back to link-text date: the parent article's datePublished
-                    # is always the page's last-updated date (June 2026), so ALL historical
-                    # PDFs linked on that page would pass a link-text-based filter.
-                    url_date = parse_date_from_pdf_url(pdf_url)
-                    if not url_date:
-                        logger.info(
-                            f"Skipping '{doc_title}': cannot parse date from URL '{pdf_url}'"
-                        )
-                        continue
-                    if url_date < two_months_ago:
-                        logger.info(
-                            f"Filtering out '{doc_title}' — PDF date {url_date.date()} "
-                            f"is older than 2 months"
-                        )
-                        continue
-                    # Use the URL-extracted date as the canonical published date
-                    published_dt = url_date
-                
-                records.append({
-                    "source_category": category,
-                    "title": doc_title,
-                    "source_url": source_article_url,
-                    "pdf_url": pdf_url,
-                    "published_date": published_dt
-                })
-                
+        seen.add(key)
+
+        title = a.get_text(strip=True) or key.split("/")[-1]
+        published_dt = parse_attachment_date(title)
+        if not published_dt:
+            logger.info(f"Skipping '{title}': cannot parse a date from the link text")
+            continue
+        if published_dt < two_months_ago:
+            logger.info(f"Filtering out '{title}' — published {published_dt.date()} is older than 2 months")
+            continue
+
+        records.append({
+            "source_category": category,
+            "title": title,
+            "source_url": source_url,
+            "pdf_url": href,
+            "published_date": published_dt
+        })
+
     return records
 
 async def cleanup_outdated_records(db_session: AsyncSession) -> dict:

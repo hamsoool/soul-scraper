@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, Dict
-from pydantic import BaseModel, ConfigDict, HttpUrl
+from pydantic import BaseModel, ConfigDict
 
 class DocumentBase(BaseModel):
     source_category: str
@@ -8,9 +8,6 @@ class DocumentBase(BaseModel):
     source_url: str
     pdf_url: str
     published_date: Optional[datetime] = None
-
-class DocumentCreate(DocumentBase):
-    content: Optional[str] = None
 
 class DocumentListItem(DocumentBase):
     id: int
