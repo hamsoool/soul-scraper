@@ -257,7 +257,9 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
         results = {}
         
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            for page in doc:
+            # Zambales (Region III) sits on the last pages — scan back-to-front
+            # and stop once both cities are found so a 16-page scan costs ~1 page of OCR.
+            for page in reversed(list(doc)):
                 pix = page.get_pixmap(dpi=150)
                 img_data = pix.tobytes("png")
                 
@@ -315,9 +317,23 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                 
                 header_row = None
                 header_idx = -1
+                # Known station brands identify the header even when OCR drops
+                # the PRODUCT cell (seen on older scans: "CITY/NUKICIPALITY"
+                # with no PRODUCT block at all).
+                STATION_MARKERS = (
+                    "PETRON", "SHELL", "CALTEX", "PHOENIX", "FLYING",
+                    "UNIOIL", "UNIO", "PTT", "PETROGAZZ", "GTOIL", "UNO FUEL",
+                    "JETT", "TOTAL", "REPHIL", "SEAOIL", "CENTR",
+                )
                 for idx, r in enumerate(rows):
                     row_texts = [b["text"].upper() for b in r]
-                    if any("PROV" in t for t in row_texts) and any("PRODUCT" in t for t in row_texts) and any("CITY" in t or "MUN" in t for t in row_texts):
+                    has_prov = any("PROV" in t for t in row_texts)
+                    has_city = any("CITY" in t or "MUN" in t or "NUKIC" in t for t in row_texts)
+                    has_product = any("PRODUCT" in t or "PRODU" in t for t in row_texts)
+                    has_stations = sum(
+                        1 for t in row_texts for m in STATION_MARKERS if m in t
+                    ) >= 2
+                    if has_prov and has_city and (has_product or has_stations):
                         header_row = r
                         header_idx = idx
                         break
@@ -336,22 +352,43 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                     txt = b["text"].upper()
                     if "PROV" in txt:
                         province_cx = b["cx"]
-                    elif "CITY" in txt or "MUN" in txt:
+                    if "CITY" in txt or "MUN" in txt:
                         city_cx = b["cx"]
-                    elif "PRODUCT" in txt:
-                        product_cx = b["cx"]
-                    elif "RANGE" in txt or "OVERALL" in txt:
+                    if "PRODUCT" in txt:
+                        # OCR often merges the two headers into one block
+                        # ("CITY/MUNICIPALITYPRODUCT"): the product column sits
+                        # on the right half of the merged block.
+                        if "CITY" in txt or "MUN" in txt:
+                            product_cx = b["cx"] + b["w"] * 0.25
+                        else:
+                            product_cx = b["cx"]
+                    if "RANGE" in txt or "OVERALL" in txt:
                         range_cx = b["cx"]
                     elif "COMMON" in txt or "PRICE" in txt:
+                        # 'elif' here is deliberate: an "OVERALL RANGE" block
+                        # must not be mistaken for a COMMON PRICE column.
                         common_cx = b["cx"]
-                    else:
+                    elif "PROV" not in txt and "CITY" not in txt and "MUN" not in txt and "PRODUCT" not in txt:
                         brand = b["text"].strip()
                         if brand:
                             station_columns.append((b["cx"], brand))
                 
                 if province_cx is None: province_cx = 200
                 if city_cx is None: city_cx = 350
-                if product_cx is None: product_cx = 450
+                if product_cx is None:
+                    # Header merge or OCR glitch left no product anchor:
+                    # estimate it from the product labels themselves.
+                    # Fuzzy tokens: older scans misread DIESEL as DESEL, etc.
+                    prod_cxs = [
+                        b["cx"] for r in rows for b in r
+                        if any(p in b["text"].upper() for p in ["RON", "DIES", "DESEL", "KERO"])
+                        and 100 < b["cx"] < 600
+                    ]
+                    if prod_cxs:
+                        prod_cxs.sort()
+                        product_cx = prod_cxs[len(prod_cxs) // 2]
+                    else:
+                        product_cx = 450
                 
                 province_anchors = []
                 city_anchors = []
@@ -360,7 +397,8 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                     for b in r:
                         txt_upper = b["text"].upper()
                         if abs(b["cx"] - province_cx) < 60:
-                            if "TARLAC" in txt_upper or "ZAMBALES" in txt_upper:
+                            # "ZANBALES" is the common OCR misread of ZAMBALES.
+                            if "TARLAC" in txt_upper or "ZAMB" in txt_upper or "ZANB" in txt_upper:
                                 province_anchors.append((b["cy"], txt_upper))
                         elif abs(b["cx"] - city_cx) < 60:
                             if any(c in txt_upper for c in ["OLONGAPO", "SUBIC", "TARLAC"]):
@@ -373,7 +411,7 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                     for b in r:
                         if abs(b["cx"] - product_cx) < 60:
                             txt = b["text"].upper()
-                            if any(p in txt for p in ["RON", "DIESEL", "KEROSENE"]):
+                            if any(p in txt for p in ["RON", "DIES", "DESEL", "KERO"]):
                                 prod_b = b
                         
                         txt = b["text"]
@@ -399,19 +437,24 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                     else:
                         norm_city = closest_city
                     
-                    if norm_city not in ["OLONGAPO CITY", "SUBIC"] and "ZAMBALES" not in closest_province:
+                    if norm_city not in ["OLONGAPO CITY", "SUBIC"] and "ZAMB" not in closest_province and "ZANB" not in closest_province:
                         continue
                     
                     prod_val = prod_b["text"].strip().upper()
                     if "RON" in prod_val:
                         parts = prod_val.replace(" ", "").split("RON")
                         if len(parts) > 1:
-                            prod_val = f"RON {parts[1]}"
-                    elif "DIESEL" in prod_val:
+                            # Keep only the grade digits ("97", "91", ...);
+                            # OCR noise like RONST/RONSS falls back to raw label.
+                            digits = "".join(c for c in parts[1] if c.isdigit())[:3]
+                            prod_val = f"RON {digits}" if digits else "RON"
+                    elif "DIES" in prod_val or "DESEL" in prod_val:
                         if "PLUS" in prod_val or "ULTRA" in prod_val:
                             prod_val = "DIESEL PLUS"
                         else:
                             prod_val = "DIESEL"
+                    elif "KERO" in prod_val:
+                        prod_val = "KEROSENE"
                     
                     station_prices = {}
                     overall_range = None
@@ -454,6 +497,10 @@ def extract_prices_from_pdf_ocr(pdf_bytes: bytes) -> Optional[str]:
                         "overall_range": overall_range,
                         "common_price": common_price
                     }
+
+                # Both Zambales cities live on the same (last) page — stop early.
+                if "OLONGAPO CITY" in results and "SUBIC" in results:
+                    break
         
         if results:
             logger.info("Successfully extracted Zambales data using OCR!")
