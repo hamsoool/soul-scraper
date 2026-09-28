@@ -20,25 +20,8 @@ services:
         value: 8000
       - key: API_KEY
         generateValue: true  # Render auto-generates a random secret
-
-  # Option: Render Cron Job to trigger sync via endpoint
-  # Note: A free-tier web service can spin down when idle.
-  # Triggering /sync via Cron ensures the service wakes up and runs sync every 24 hours.
-  - type: cron
-    name: doe-pdf-aggregator-cron
-    env: docker
-    dockerfilePath: Dockerfile
-    schedule: "0 0 * * *" # Runs daily at midnight UTC
-    buildCommand: "pip install httpx"
-    # Calls the main web service URL to trigger the background sync task
-    startCommand: "curl -X POST -H \"X-API-Key: $API_KEY\" https://doe-pdf-aggregator.onrender.com/sync"
-    plan: free
-    envVars:
-      - key: API_KEY
-        fromService:
-          name: doe-pdf-aggregator
-          type: web
-          envVarKey: API_KEY
+      - key: ENABLE_SCRAPER_SCHEDULER
+        value: false  # GitHub Actions runs sync.py on schedule; the API stays read-only
 
 databases:
   - name: doe-scraper-db
