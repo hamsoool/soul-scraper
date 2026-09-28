@@ -1,0 +1,32 @@
+name: Midnight DOE sync
+
+# Runs sync.py at 00:00 Asia/Manila every day — the cloud replacement for the
+# local Windows Task Scheduler job. GitHub cron is always UTC; Manila is
+# UTC+8 year-round (no daylight saving), so 16:00 UTC == midnight local.
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch: {}  # manual "Run workflow" button in the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync.py against Supabase
+        run: python sync.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
