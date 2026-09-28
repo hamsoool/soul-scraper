@@ -30,3 +30,18 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           API_KEY: ${{ secrets.API_KEY }}
+
+      - name: Verify freshness
+        run: python check_freshness.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+
+      - name: Notify on failure
+        if: failure() && env.TELEGRAM_BOT_TOKEN != ''
+        run: >
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}"
+          -d text="DOE midnight sync FAILED. Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
