@@ -1,0 +1,3 @@
+# CI-only test tooling. Kept separate so the Render image stays lean.
+pytest==9.1.1
+ruff==0.16.9

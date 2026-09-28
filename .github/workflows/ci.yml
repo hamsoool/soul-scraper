@@ -1,0 +1,48 @@
+name: CI
+
+# Test every push and pull request to main. Passing tests on main also trigger
+# the Render deploy (via deploy hook) — failing tests block it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Importing app.* validates Settings(), which requires API_KEY.
+      # Dummy value: tests never touch the network or the database.
+      API_KEY: ci-dummy
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-ci.txt
+
+      - name: Lint tests
+        run: ruff check tests/
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  deploy:
+    needs: test
+    # Main pushes only — PRs get checked but never deployed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.RENDER_DEPLOY_HOOK != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+    steps:
+      - name: Trigger Render deploy
+        run: curl -s -X POST "$RENDER_DEPLOY_HOOK"
